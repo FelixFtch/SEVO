@@ -1,17 +1,47 @@
 # SEVO: Semantic-Enhanced Virtual Observation
 
-> **Observation-space enhancement for policy-agnostic robot manipulation**
+> A data-centric observation pipeline for improving cross-environment robustness of imitation-learning policies on low-cost robot hardware.
 >
-> SEVO injects sparse semantic cues (YOLO overlay + red LED illumination) into standard RGB streams, enabling cross-environment generalization without modifying the policy architecture.
+> **Scope:** Single-task pick-and-place with transparent bottles. This is a case study in observation-space design, not a general-purpose manipulation system.
+
+## What This Is (and What It Is Not)
+
+SEVO is a method for modifying **what the policy sees**, not how it learns. It combines YOLO segmentation overlay, active red LED illumination, and diversified data collection to help standard policies (ACT, SmolVLA) transfer across visually different environments.
+
+**What SEVO demonstrates:**
+- Observation-space modifications (overlay + lighting + data diversity) can substantially improve cross-environment transfer for a single manipulation task
+- Diversified backgrounds during data collection are the dominant factor for generalization, outranking both active illumination and YOLO overlay
+- Body-fixed cameras substantially outperform wrist cameras on low-cost SO-101 arms
+- These effects are consistent across two robot platforms, two policy architectures, and hundreds of real-robot trials
+
+**What SEVO does NOT address:**
+- Multi-task manipulation (e.g., BEHAVIOR benchmark tasks)
+- Multi-object discrimination (the overlay applies the same color to all detected objects; the policy cannot distinguish "pick bottle A, not cup B" through the overlay alone)
+- Language-conditioned task switching (SmolVLA receives a fixed prompt; no dynamic instruction following is evaluated)
+- Generalization to object categories not in the YOLO training set
+- Comparison with large-scale VLAs (π0.5, OpenVLA, GR00T) that target general-purpose manipulation
+
+This work targets a specific, well-defined problem: closing the background-generalization gap for a single task on community-accessible hardware. Extending to multi-task settings requires additional mechanisms (e.g., per-class overlay colors, language-conditioned detection, broader task coverage in training data) that are not validated here.
 
 ## Results
 
-| Policy | Params | Trainable | Episodes | Cross-Env Success |
-|--------|--------|-----------|----------|-------------------|
-| ACT    | 51.60M | 100%      | 80       | **97%**           |
-| SmolVLA| 450.05M| 22.2%     | 120      | **86%**           |
+Evaluated over 80-100 real-robot trials per condition.
 
-Trained at home, deployed at university campus with no fine-tuning.
+| Setting | ACT | SmolVLA |
+|---------|-----|---------|
+| Training environment | 95% | 83% |
+| Novel environments (similar floor tone) | 85% | 75% |
+| Novel environments (extreme, out-of-distribution floor) | 10% | 5% |
+| **No SEVO, training env** | 75% | 70% |
+| **No SEVO, novel env** | 30% | 35% |
+| **No SEVO, extreme** | 0% | 0% |
+
+The extreme-environment gap (bright white floor absent from all training data) confirms that SEVO's robustness is bounded by the visual diversity of the training distribution. A separate training run in the white-floor lab closed this gap, indicating the limitation is data coverage, not the method itself.
+
+**Component importance ranking (from ablation):**
+```
+Varied Backgrounds (dominant) > Red LED (second) > YOLO Overlay (third)
+```
 
 ---
 
@@ -22,6 +52,7 @@ Trained at home, deployed at university campus with no fine-tuning.
 - [Boot to Evaluation (5 Phases)](#step-by-step-boot-to-evaluation)
 - [Data Collection Protocol](#data-collection-protocol)
 - [Architecture Details](#architecture-details)
+- [Known Limitations](#known-limitations)
 
 ---
 
@@ -106,7 +137,7 @@ python tools/yolo/yolo_seg_highlight_to_v4l2.py \
   --conf 0.20 --iou 0.5 --mask_th 0.3 --alpha 0.45
 ```
 
-**Terminal 3 (wrist, for control experiments):**
+**Terminal 3 (wrist, for ablation only):**
 ```bash
 conda activate lerobot_lab && cd ~/lerobot_lab
 python tools/yolo/yolo_seg_highlight_to_v4l2.py \
@@ -116,15 +147,15 @@ python tools/yolo/yolo_seg_highlight_to_v4l2.py \
   --conf 0.20 --iou 0.5 --mask_th 0.3 --alpha 0.45
 ```
 
-**Quick verify:** `ffplay /dev/video10` should show the front camera with yellow bottle overlay.
+**Verify:** `ffplay /dev/video10` should show the front camera with yellow bottle overlay.
 
 ### Phase 3: Teleoperate & Collect Data
 
-#### Full SEVO dataset (YOLO + red LED ON + diversified backgrounds)
+#### SEVO dataset (YOLO overlay + red LED ON + diversified backgrounds)
 
 ```bash
 conda activate lerobot_lab && cd ~/lerobot_lab
-# IMPORTANT: Turn on red LED hardware before starting!
+# Turn on red LED hardware before starting!
 
 lerobot-record \
   --robot.type=so101_follower \
@@ -165,7 +196,7 @@ lerobot-record \
 
 ### Phase 4: Train
 
-#### ACT (batch=24, ~260k steps, ~6h on RTX 4090)
+#### ACT (batch=24, ~400K steps)
 
 ```bash
 conda activate lerobot_lab && cd ~/lerobot_lab
@@ -173,15 +204,15 @@ conda activate lerobot_lab && cd ~/lerobot_lab
 lerobot-train \
   --dataset.repo_id=${HF_USER}/sevo_yolo_redlight_bottle_pickup \
   --policy.type=act \
-  --output_dir=outputs/train/act_b24_s260k_sevo_full \
+  --output_dir=outputs/train/act_b24_s400k_sevo_full \
   --job_name=act_sevo_full \
   --training.batch_size=24 \
-  --training.steps=260000 \
+  --training.steps=400000 \
   --policy.device=cuda \
   --wandb.enable=true
 ```
 
-#### SmolVLA (batch=64, ~20k steps, ~4h on RTX 4090)
+#### SmolVLA (batch=64, ~20K steps, fine-tune from pretrained)
 
 ```bash
 lerobot-train \
@@ -202,7 +233,7 @@ lerobot-train \
 ```bash
 conda activate lerobot_lab && cd ~/lerobot_lab
 
-MODEL="act_b24_s260k_sevo_full"
+MODEL="act_b24_s400k_sevo_full"
 CKPT="last"
 POLICY="$PWD/outputs/train/${MODEL}/checkpoints/${CKPT}/pretrained_model"
 EVAL_ID="eval_${MODEL}_ckpt${CKPT}"
@@ -230,7 +261,7 @@ lerobot-record \
 #### Evaluate SmolVLA with SEVO
 
 ```bash
-# NOTE: SmolVLA uses camera keys camera1/camera2/camera3 (not front/side/wrist)
+# NOTE: SmolVLA uses camera keys camera1/camera2/camera3
 
 MODEL="smolvla_b64_s20k_sevo_full"
 CKPT="last"
@@ -257,8 +288,9 @@ lerobot-record \
   --robot.disable_torque_on_disconnect=false
 ```
 
-> **Critical:** ACT uses `front`/`side`/`wrist` keys. SmolVLA uses `camera1`/`camera2`/`camera3`. Must match training.
-> **Critical:** `--policy.path` must be an **absolute path** (use `$PWD/...`). Relative paths get interpreted as HuggingFace repo IDs.
+> **ACT** uses camera keys `front`/`side`/`wrist`. **SmolVLA** uses `camera1`/`camera2`/`camera3`. Must match training.
+
+> `--policy.path` must be an **absolute path** (`$PWD/...`). Relative paths are interpreted as HuggingFace repo IDs.
 
 ---
 
@@ -266,34 +298,56 @@ lerobot-record \
 
 | Factor | What to vary | Importance |
 |--------|-------------|------------|
-| **Backgrounds** | Tablecloths, backdrops, posters | #1 (forces feature disentanglement) |
+| **Backgrounds** | Tablecloths, backdrops, floor coverings | #1 (dominant) |
 | **Lighting** | Room lights on/off/dim + red LED always on | #2 |
-| **Distractors** | Random objects near bottle | #3 |
+| **Distractors** | Random objects near bottle, people walking through | #3 |
 | **Null episodes** | Arm stationary, no bottle (5-10 episodes) | Prevents false positives |
 | **Object pose** | Bottle angle, position, distance | Placement target stays fixed |
 
-**Component importance (from ablation): Varied BG > Red LED > YOLO Overlay**
+---
+
+## Architecture Details
+
+### Overlay Formula
+
+```
+Ĩ_t = (1 - α·M_t) ⊙ I_t + α·M_t ⊙ C
+
+α = 0.45, C = [255, 255, 0] (yellow)
+```
+
+### Why ACT Benefits More Than SmolVLA
+
+```
+ACT path:     Ĩ_t → conv1 [64,3,7,7] (TRAINABLE, 9408 params)
+                   → ResNet-18 layers (TRAINABLE, 11.18M)
+                   → Transformer enc/dec (TRAINABLE)
+                   → action
+
+SmolVLA path: Ĩ_t → SigLIP patch_embed [768,3,16,16] (FROZEN)
+                   → SigLIP ViT 12-layer (FROZEN, 85.1M)
+                   → SmolLM2 16-layer (FROZEN, 251.6M)
+                   → Action Expert 16-layer (TRAINABLE, 98.2M)
+                   → action
+```
+
+ACT's trainable conv1 adapts directly to the overlay color signature. SmolVLA's frozen SigLIP compresses each 16x16 patch into a single token, losing fine-grained overlay detail before the signal reaches the trainable Action Expert.
 
 ---
 
-## Architecture: Why SEVO Works Differently on ACT vs SmolVLA
+## Known Limitations
 
-```
-SEVO pixel modification: Ĩ_t = (1-α·M_t) ⊙ I_t + α·M_t ⊙ C
+**Single-task only.** All experiments use one task (pick bottle, place to side). Multi-task evaluation (e.g., BEHAVIOR benchmark) is not conducted. Extending SEVO to multi-task settings would require per-class overlay differentiation and broader task coverage in training data, neither of which is validated here.
 
-ACT path:     Ĩ_t → conv1 [64,3,7,7] (TRAINABLE, 9408 params)
-                     → ResNet-18 layers (TRAINABLE, 11.18M)
-                     → Transformer enc/dec (TRAINABLE)
-                     → action
+**Single object category.** The YOLO overlay highlights all detected "bottle" instances with the same color. In scenes with multiple object types requiring different actions, the current overlay cannot convey which object to manipulate. A per-class color scheme or language-conditioned detection would be needed.
 
-SmolVLA path: Ĩ_t → SigLIP patch_embed [768,3,16,16] (FROZEN)
-                     → SigLIP ViT 12-layer (FROZEN, 85.1M)
-                     → SmolLM2 16-layer (FROZEN, 251.6M)
-                     → Action Expert 16-layer (TRAINABLE, 98.2M)
-                     → action
-```
+**No comparison with large-scale VLAs.** We evaluate on ACT (51.60M) and SmolVLA (450.05M) because they run on our edge hardware. We do not compare with π0.5, OpenVLA, GR00T, or other billion-parameter models that target general-purpose manipulation.
 
-ACT's conv1 filters start from ImageNet pretrained weights (color-sensitive) and adapt directly to the yellow overlay signature. SmolVLA's frozen SigLIP compresses each 16x16 pixel patch into a single 768-dim token, losing overlay boundary detail before the signal reaches the trainable Action Expert.
+**Training distribution bounds robustness.** SEVO does not guarantee generalization to visual conditions absent from training data. Our extreme-environment results (10% on white floors when trained only on dark floors) demonstrate this explicitly.
+
+**Static grasping only.** The mobile base must stop before the arm executes. Grasping while moving drops success to approximately 10%.
+
+**YOLO dependency.** Performance depends on detection quality. Novel object categories or heavy occlusion degrade the overlay.
 
 ---
 
@@ -302,7 +356,7 @@ ACT's conv1 filters start from ImageNet pretrained weights (color-sensitive) and
 ```bibtex
 @inproceedings{sevo2026iros,
   title={{SEVO}: Semantic-Enhanced Virtual Observation for Cross-Environment Robot Manipulation},
-  author={...},
+  author={Fang, Tianchonghui and Zhuang, Yuan and Miao, Fei},
   booktitle={IEEE/RSJ International Conference on Intelligent Robots and Systems (IROS)},
   year={2026}
 }
